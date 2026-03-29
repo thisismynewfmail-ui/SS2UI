@@ -64,7 +64,7 @@ PD={
 CFG={"ollama_host":"http://localhost:11434","llamacpp_host":"http://localhost:8080",
  "engine":"ollama","model":"","system_prompt":"","keep_alive":"5m",
  "think_enabled":True,"think_visible":False,"show_stats":False,"is_thinking_model":False,
- "chat_template":""}
+ "dumb_thinking":False,"chat_template":""}
 PO,MDFL={},{}
 
 THEMES={
@@ -294,7 +294,7 @@ def get_lan_ip():
     except: return "127.0.0.1"
 def get_cfg_state():
     return {"connection":{k:CFG[k] for k in ("ollama_host","llamacpp_host","engine","model","system_prompt","keep_alive","chat_template")},
-        "toggles":{k:CFG[k] for k in ("think_enabled","think_visible","show_stats")},"param_overrides":dict(PO)}
+        "toggles":{k:CFG[k] for k in ("think_enabled","think_visible","show_stats","dumb_thinking")},"param_overrides":dict(PO)}
 def apply_cfg_state(st):
     global PO
     for k,v in st.get("connection",{}).items():
@@ -394,7 +394,7 @@ def api_config():
     data=request.json
     for k in ("ollama_host","llamacpp_host","engine","model","system_prompt","keep_alive","chat_template"):
         if k in data: CFG[k]=data[k]
-    for k in ("think_enabled","think_visible","show_stats"):
+    for k in ("think_enabled","think_visible","show_stats","dumb_thinking"):
         if k in data: CFG[k]=bool(data[k])
     if "params" in data:
         PO.clear()
@@ -689,17 +689,26 @@ def api_chat():
 
     # Context cutoff: trim history to fit within num_ctx
     num_ctx=eff("num_ctx")
+    dumb_think=CFG.get("dumb_thinking",False)
     history_for_api=[]
     for msg in all_msgs:
         c=msg["content"]
-        if msg["role"]=="assistant": c=strip_think(c)
+        if msg["role"]=="assistant":
+            if dumb_think:
+                # In dumb thinking mode, reconstruct think tags into content so the model sees them
+                th=msg.get("thinking","")
+                if th and "<think>" not in c:
+                    c=f"<think>{th}</think>\n{c}"
+            else:
+                c=strip_think(c)
         history_for_api.append({"role":msg["role"],"content":c})
 
     trimmed=trim_messages_to_context(history_for_api, num_ctx, sys_tokens_est)
 
     api_msgs=sys_parts+trimmed
     eng=CFG.get("engine","ollama")
-    think_on=CFG["think_enabled"] and CFG["is_thinking_model"]
+    # Dumb thinking: never send think=true to Ollama (avoids 400 on non-thinking models)
+    think_on=CFG["think_enabled"] and CFG["is_thinking_model"] and not dumb_think
 
     def gen():
         mem_action_inject=f"injected:{len(retrieved)}" if retrieved else ("no_match" if ltm.config["enable_injection"] else "inject_off")
@@ -751,6 +760,7 @@ def api_chat():
                                 st["prompt_eval_count"]=usage.get("prompt_tokens",0)
                     except: pass
                 # Handle think tags in final content (llama.cpp has no native think field)
+                if dumb_think: fc=re.sub(r'<\|?/?nothink\|?>', '', fc)
                 think_match=re.search(r'<think>([\s\S]*?)</think>',fc)
                 if think_match:
                     ft=think_match.group(1).strip()
@@ -759,7 +769,7 @@ def api_chat():
                     if ft: yield f"data: {json.dumps({'think_start':True})}\n\n"
                     if ft: yield f"data: {json.dumps({'think_end':True,'think_duration':0})}\n\n"
                 _append_to_active({"role":"assistant","content":fc,"thinking":ft})
-                yield f"data: {json.dumps({'done':True,'stats':st,'version':_chat_version})}\n\n"
+                yield f"data: {json.dumps({'done':True,'stats':st,'version':_chat_version,'dumb_thinking':dumb_think})}\n\n"
                 if (ltm.config["enable_saving"] or ltm.config.get("dumb_mode")) and fc:
                     ltm.evaluate_and_store(user_msg, fc)
                     yield f"data: {json.dumps({'mem_save':ltm.last_action,'mem_interest':ltm.last_interest})}\n\n"
@@ -788,8 +798,24 @@ def api_chat():
                     if ch.get("done"):
                         if t0 and not te: yield f"data: {json.dumps({'think_end':True,'think_duration':round(time.time()-t0,1)})}\n\n"
                         st={k:ch[k] for k in ("total_duration","load_duration","eval_count","eval_duration","prompt_eval_count","prompt_eval_duration") if k in ch}
+                        # Dumb thinking: parse <think> tags from content stream
+                        if dumb_think:
+                            # Strip nothink tokens
+                            fc=re.sub(r'<\|?/?nothink\|?>', '', fc)
+                            if not ft:
+                                think_match=re.search(r'<think>([\s\S]*?)</think>',fc)
+                                if think_match:
+                                    ft=think_match.group(1).strip()
+                                    fc=fc[:think_match.start()]+fc[think_match.end():]
+                                    fc=fc.strip()
+                                else:
+                                    # Handle unclosed <think> tag
+                                    open_match=re.search(r'<think>([\s\S]*)$',fc)
+                                    if open_match:
+                                        ft=open_match.group(1).strip()
+                                        fc=fc[:open_match.start()].strip()
                         _append_to_active({"role":"assistant","content":fc,"thinking":ft})
-                        yield f"data: {json.dumps({'done':True,'stats':st,'version':_chat_version})}\n\n"
+                        yield f"data: {json.dumps({'done':True,'stats':st,'version':_chat_version,'dumb_thinking':dumb_think})}\n\n"
                         if (ltm.config["enable_saving"] or ltm.config.get("dumb_mode")) and fc:
                             ltm.evaluate_and_store(user_msg, fc)
                             yield f"data: {json.dumps({'mem_save':ltm.last_action,'mem_interest':ltm.last_interest})}\n\n"
