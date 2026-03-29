@@ -778,7 +778,8 @@ def api_chat():
                 # ═══ OLLAMA via /api/chat ═══
                 options=build_ollama_opts()
                 payload={"model":CFG["model"],"messages":api_msgs,"stream":True,"options":options}
-                if CFG["is_thinking_model"]: payload["think"]=think_on
+                # Dumb thinking: don't send think param at all — let the model behave naturally
+                if not dumb_think and CFG["is_thinking_model"]: payload["think"]=think_on
                 if CFG.get("keep_alive"): payload["keep_alive"]=CFG["keep_alive"]
                 if CFG.get("chat_template","").strip(): payload["template"]=CFG["chat_template"]
                 r=R.post(f"{CFG['ollama_host']}/api/chat",json=payload,stream=True,timeout=300)
@@ -819,6 +820,121 @@ def api_chat():
                         if (ltm.config["enable_saving"] or ltm.config.get("dumb_mode")) and fc:
                             ltm.evaluate_and_store(user_msg, fc)
                             yield f"data: {json.dumps({'mem_save':ltm.last_action,'mem_interest':ltm.last_interest})}\n\n"
+        except R.exceptions.ConnectionError:
+            yield f"data: {json.dumps({'error':'Cannot connect to '+eng})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error':str(e)})}\n\n"
+    return Response(stream_with_context(gen()),mimetype="text/event-stream")
+
+@app.route("/api/chat/continue",methods=["POST"])
+def api_chat_continue():
+    """Continue the last assistant message by sending the conversation as-is."""
+    if not CFG["model"]: return jsonify({"error":"No model selected."}),400
+    data_chat=_get_active()
+    all_msgs=data_chat.get("messages",[])
+    if not all_msgs or all_msgs[-1].get("role")!="assistant":
+        return jsonify({"error":"No assistant message to continue"}),400
+
+    # Pop the last assistant message — we'll extend it
+    last_asst=all_msgs[-1]
+    prev_content=last_asst.get("content","")
+    prev_thinking=last_asst.get("thinking","")
+    all_msgs=all_msgs[:-1]  # history without the last assistant msg
+
+    # Build system messages
+    sys_parts=[]
+    sp=process_sys(CFG["system_prompt"])
+    if sp: sys_parts.append({"role":"system","content":sp})
+
+    sys_chars=sum(len(m["content"]) for m in sys_parts)
+    sys_tokens_est=sys_chars//4+20
+
+    num_ctx=eff("num_ctx")
+    dumb_think=CFG.get("dumb_thinking",False)
+    history_for_api=[]
+    for msg in all_msgs:
+        c=msg["content"]
+        if msg["role"]=="assistant":
+            if dumb_think:
+                th=msg.get("thinking","")
+                if th and "<think>" not in c: c=f"<think>{th}</think>\n{c}"
+            else: c=strip_think(c)
+        history_for_api.append({"role":msg["role"],"content":c})
+    # Add the partial assistant message so the model continues from it
+    cont_content=prev_content
+    if dumb_think and prev_thinking and "<think>" not in cont_content:
+        cont_content=f"<think>{prev_thinking}</think>\n{cont_content}"
+    elif not dumb_think:
+        cont_content=strip_think(cont_content)
+    history_for_api.append({"role":"assistant","content":cont_content})
+
+    trimmed=trim_messages_to_context(history_for_api, num_ctx, sys_tokens_est)
+    api_msgs=sys_parts+trimmed
+    eng=CFG.get("engine","ollama")
+    think_on=CFG["think_enabled"] and CFG["is_thinking_model"] and not dumb_think
+
+    def gen():
+        fc,ft="",""
+        try:
+            if eng=="llamacpp":
+                opts=build_llamacpp_opts()
+                payload={"model":CFG["model"],"messages":api_msgs,"stream":True}
+                payload.update(opts)
+                headers={"Content-Type":"application/json","Authorization":"Bearer no-key"}
+                r=R.post(f"{CFG['llamacpp_host']}/v1/chat/completions",json=payload,headers=headers,stream=True,timeout=300)
+                if r.status_code!=200:
+                    try: err_body=r.json();err_msg=err_body.get("error",{}).get("message",r.text) if isinstance(err_body.get("error"),dict) else err_body.get("error",r.text)
+                    except: err_msg=r.text or f"HTTP {r.status_code}"
+                    yield f"data: {json.dumps({'error':f'llama.cpp ({r.status_code}): {err_msg}'})}" + "\n\n";return
+                st={}
+                for line in r.iter_lines():
+                    if not line: continue
+                    line=line.decode('utf-8') if isinstance(line,bytes) else line
+                    if not line.startswith("data: "): continue
+                    chunk=line[6:].strip()
+                    if chunk=="[DONE]": break
+                    try:
+                        d=json.loads(chunk)
+                        delta=d.get("choices",[{}])[0].get("delta",{})
+                        ct=delta.get("content","")
+                        if ct: fc_l=ct;yield f"data: {json.dumps({'token':ct})}\n\n"
+                    except: pass
+                fc=fc  # fc not used in llamacpp streaming, use prev_content+tokens
+            else:
+                # ═══ OLLAMA via /api/chat ═══
+                options=build_ollama_opts()
+                payload={"model":CFG["model"],"messages":api_msgs,"stream":True,"options":options}
+                if not dumb_think and CFG["is_thinking_model"]: payload["think"]=think_on
+                if CFG.get("keep_alive"): payload["keep_alive"]=CFG["keep_alive"]
+                if CFG.get("chat_template","").strip(): payload["template"]=CFG["chat_template"]
+                r=R.post(f"{CFG['ollama_host']}/api/chat",json=payload,stream=True,timeout=300)
+                if r.status_code!=200:
+                    try: err_body=r.json();err_msg=err_body.get("error",r.text)
+                    except: err_msg=r.text or f"HTTP {r.status_code}"
+                    yield f"data: {json.dumps({'error':f'Ollama ({r.status_code}): {err_msg}'})}" + "\n\n";return
+                for line in r.iter_lines():
+                    if not line: continue
+                    ch=json.loads(line);msg=ch.get("message",{});ct=msg.get("content","")
+                    if ct: fc+=ct;yield f"data: {json.dumps({'token':ct})}\n\n"
+                    if ch.get("done"):
+                        st={k:ch[k] for k in ("total_duration","load_duration","eval_count","eval_duration","prompt_eval_count","prompt_eval_duration") if k in ch}
+                        # Parse dumb think tags from continuation
+                        if dumb_think:
+                            fc=re.sub(r'<\|?/?nothink\|?>', '', fc)
+                        # Merge: update the last assistant message with extended content
+                        combined_content=prev_content+fc
+                        combined_thinking=prev_thinking
+                        if dumb_think and not combined_thinking:
+                            think_match=re.search(r'<think>([\s\S]*?)</think>',combined_content)
+                            if think_match:
+                                combined_thinking=think_match.group(1).strip()
+                                combined_content=combined_content[:think_match.start()]+combined_content[think_match.end():]
+                                combined_content=combined_content.strip()
+                        # Update the last assistant message in chat
+                        chat_data=_get_active()
+                        chat_data["messages"][-1]={"role":"assistant","content":combined_content,"thinking":combined_thinking}
+                        _write_chat(chat_data)
+                        yield f"data: {json.dumps({'done':True,'stats':st,'version':_chat_version,'dumb_thinking':dumb_think})}\n\n"
         except R.exceptions.ConnectionError:
             yield f"data: {json.dumps({'error':'Cannot connect to '+eng})}\n\n"
         except Exception as e:

@@ -444,7 +444,7 @@ async function unsend(){await J('/api/active/unsend');await loadActive();showMem
 function stD(t){return t?t.replace(/<\|?\/?nothink\|?>/g,'').replace(/<think>[\s\S]*?<\/think>\s*/g,'').trim():t}
 
 /* Chat */
-function addM(role,txt){const c=document.getElementById('msgs');const d=document.createElement('div');d.className='cm '+(role==='u'?'u':'a');const now=new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});const rl=role==='u'?'USER':llmName.toUpperCase();const idx=c.querySelectorAll('.cm.u,.cm.a').length;d.dataset.msgIdx=idx;d.innerHTML=`<div class="msg-actions"><button class="msg-edit" onclick="editMsg(this)" title="Edit">✎</button><button class="msg-edit" onclick="regenMsg(this)" title="Regenerate">⟳</button></div><div class="mhr"><span class="mr">${rl}</span><span class="mts gs2${ss()?' vis':''}">${now}</span></div><div class="mc"></div>`;d.querySelector('.mc').textContent=txt;c.appendChild(d);scrollChat();return d}
+function addM(role,txt){const c=document.getElementById('msgs');const d=document.createElement('div');d.className='cm '+(role==='u'?'u':'a');const now=new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});const rl=role==='u'?'USER':llmName.toUpperCase();const idx=c.querySelectorAll('.cm.u,.cm.a').length;d.dataset.msgIdx=idx;const contBtn=role==='a'?'<button class="msg-edit" onclick="continueMsg(this)" title="Continue">▶</button>':'';d.innerHTML=`<div class="msg-actions"><button class="msg-edit" onclick="editMsg(this)" title="Edit">✎</button><button class="msg-edit" onclick="regenMsg(this)" title="Regenerate">⟳</button>${contBtn}</div><div class="mhr"><span class="mr">${rl}</span><span class="mts gs2${ss()?' vis':''}">${now}</span></div><div class="mc"></div>`;d.querySelector('.mc').textContent=txt;c.appendChild(d);scrollChat();return d}
 function sM(t){const c=document.getElementById('msgs');const d=document.createElement('div');d.className='cm sy';d.innerHTML=`<div class="mc">${esc(t)}</div>`;c.appendChild(d);scrollChat()}
 function stopGen(){if(abortCtrl){abortCtrl.abort();abortCtrl=null}}
 function resetBusy(){busy=0;abortCtrl=null;document.getElementById('sBtn').textContent='SEND';document.getElementById('bStop').style.display='none';
@@ -480,6 +480,21 @@ const bar=document.createElement('div');bar.style.cssText='display:flex;gap:4px;
 bar.children[0].onclick=async()=>{const nv=ta.value;await J('/api/active/edit',{index:idx,content:nv});await loadActive()};
 bar.children[1].onclick=()=>{const mc2=document.createElement('div');mc2.className='mc';mc2.textContent=old;ta.replaceWith(mc2);bar.remove();btn.style.display=''}}
 async function regenMsg(btn){if(busy)return;const cm=btn.closest('.cm');const idx=parseInt(cm.dataset.msgIdx);const d=await J('/api/active/regen',{index:idx});if(d.status==='ok'&&d.message){await loadActive();goChat();document.getElementById('ci').value=d.message;sendMsg()}}
+async function continueMsg(btn){if(busy)return;
+try{await J('/api/config',{think_enabled:document.getElementById('cfgTE').classList.contains('on'),think_visible:document.getElementById('cfgTV').classList.contains('on'),show_stats:document.getElementById('cfgSS').classList.contains('on'),dumb_thinking:document.getElementById('cfgDT').classList.contains('on')})}catch{}
+busy=1;abortCtrl=new AbortController();document.getElementById('sBtn').textContent='...';document.getElementById('bStop').style.display='';startWf();
+const cm=btn.closest('.cm');const cntEl=cm.querySelector('.mc');const prevText=cntEl.textContent;
+let fT='',gotError=false;
+try{const resp=await fetch('/api/chat/continue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),signal:abortCtrl.signal});
+if(!resp.ok){const e=await resp.json();sM(e.error||'ERROR');resetBusy();return}
+const reader=resp.body.getReader(),dec=new TextDecoder();let buf='';
+while(true){const{done,value}=await reader.read();if(done||gotError)break;buf+=dec.decode(value,{stream:true});const lines=buf.split('\n');buf=lines.pop();
+for(const line of lines){if(!line.startsWith('data: '))continue;try{const D=JSON.parse(line.slice(6));
+if(D.error){sM('[ERROR] '+D.error);gotError=true;break}
+if(D.token){fT+=D.token;cntEl.textContent=prevText+cleanC(fT);scrollChat();bbTick()}
+if(D.done){knownVer=D.version||knownVer+1;cntEl.textContent=prevText+cleanC(fT);updSidebar()}}catch(pe){console.warn(pe)}}}}
+catch(e){if(e.name!=='AbortError')sM('ERR: '+e.message)}
+finally{resetBusy()}}
 
 /* Chat actions */
 async function newChat(){await J('/api/active/new');await loadActive();sM('NEW SESSION');goChat()}
